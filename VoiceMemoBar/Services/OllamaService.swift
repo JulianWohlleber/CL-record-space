@@ -2,7 +2,14 @@ import Foundation
 
 final class OllamaService {
     private let baseURL = "http://localhost:11434"
-    private let model = "mistral"
+
+    /// Resolved model name — reads from AppSettings on each call so changes
+    /// take effect immediately without restarting.
+    private var model: String {
+        // AppSettings is @MainActor, but we only read a UserDefaults-backed
+        // string — safe to access the raw default directly here.
+        UserDefaults.standard.string(forKey: "ollamaModel") ?? "mistral"
+    }
 
     func correctTranscript(_ rawText: String) async throws -> String {
         let prompt = """
@@ -55,7 +62,7 @@ final class OllamaService {
         let originalMarkerCount = rawText.components(separatedBy: "==").count
         let correctedMarkerCount = trimmed.components(separatedBy: "==").count
         if originalMarkerCount > 1 && correctedMarkerCount < originalMarkerCount {
-            print("[OllamaService] Correction lost markers (\(originalMarkerCount) → \(correctedMarkerCount)), using raw transcript")
+            print("[OllamaService] Correction lost markers (\(originalMarkerCount) -> \(correctedMarkerCount)), using raw transcript")
             return rawText
         }
 
@@ -71,11 +78,11 @@ final class OllamaService {
         let prompt: String
         if isGerman {
             prompt = """
-            Lies dieses Meeting-Transkript und erzeuge einen kurzen Titel (2–5 Wörter) \
+            Lies dieses Meeting-Transkript und erzeuge einen kurzen Titel (2-5 Woerter) \
             auf Deutsch, der das Hauptthema wiedergibt. Gib AUSSCHLIESSLICH den Titel \
-            in kebab-case zurück (Kleinbuchstaben, Bindestriche statt Leerzeichen, \
-            ohne Umlaute — schreibe ä→ae, ö→oe, ü→ue, ß→ss). Keine Anführungszeichen, \
-            keine Erklärung. \
+            in kebab-case zurueck (Kleinbuchstaben, Bindestriche statt Leerzeichen, \
+            ohne Umlaute — schreibe ae, oe, ue, ss). Keine Anfuehrungszeichen, \
+            keine Erklaerung. \
             Beispiele: "quartalsbudget-besprechung", "onboarding-flow-redesign", "api-migrationsplan"
 
             Transkript:
@@ -123,10 +130,10 @@ final class OllamaService {
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
             .replacingOccurrences(of: "\"", with: "")
-            .replacingOccurrences(of: "ä", with: "ae")
-            .replacingOccurrences(of: "ö", with: "oe")
-            .replacingOccurrences(of: "ü", with: "ue")
-            .replacingOccurrences(of: "ß", with: "ss")
+            .replacingOccurrences(of: "\u{00E4}", with: "ae")
+            .replacingOccurrences(of: "\u{00F6}", with: "oe")
+            .replacingOccurrences(of: "\u{00FC}", with: "ue")
+            .replacingOccurrences(of: "\u{00DF}", with: "ss")
             .replacingOccurrences(of: " ", with: "-")
             .filter { ($0.isASCII && $0.isLetter) || $0.isNumber || $0 == "-" }
             .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
@@ -136,11 +143,31 @@ final class OllamaService {
         return String(cleaned.prefix(60))
     }
 
+    /// Check if Ollama is running AND the configured model is available.
     func isAvailable() async -> Bool {
         guard let url = URL(string: "\(baseURL)/api/tags") else { return false }
         do {
-            let (_, response) = try await URLSession.shared.data(from: url)
-            return (response as? HTTPURLResponse)?.statusCode == 200
+            let (data, response) = try await URLSession.shared.data(from: url)
+            guard (response as? HTTPURLResponse)?.statusCode == 200 else { return false }
+
+            // Verify the configured model is actually pulled
+            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let models = json["models"] as? [[String: Any]] else {
+                return false
+            }
+
+            let targetModel = model
+            let modelExists = models.contains { entry in
+                guard let name = entry["name"] as? String else { return false }
+                // Ollama model names may include a tag suffix like ":latest"
+                return name == targetModel || name.hasPrefix("\(targetModel):")
+            }
+
+            if !modelExists {
+                print("[OllamaService] Model '\(targetModel)' not found in Ollama. Available: \(models.compactMap { $0["name"] as? String })")
+            }
+
+            return modelExists
         } catch {
             return false
         }
@@ -150,11 +177,13 @@ final class OllamaService {
 enum OllamaError: LocalizedError {
     case requestFailed
     case invalidResponse
+    case modelNotFound(String)
 
     var errorDescription: String? {
         switch self {
         case .requestFailed: return "Ollama request failed"
         case .invalidResponse: return "Invalid response from Ollama"
+        case .modelNotFound(let name): return "Model '\(name)' not found in Ollama"
         }
     }
 }

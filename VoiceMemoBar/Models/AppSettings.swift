@@ -51,6 +51,7 @@ final class AppSettings: ObservableObject {
         static let baseFolderBookmark = "baseFolderBookmark"
         static let language = "language"
         static let engine = "transcriptionEngine"
+        static let ollamaModel = "ollamaModel"
     }
 
     @Published var isSetupComplete: Bool = false
@@ -60,6 +61,9 @@ final class AppSettings: ObservableObject {
     @Published var engine: TranscriptionEngine {
         didSet { defaults.set(engine.rawValue, forKey: Keys.engine) }
     }
+    @Published var ollamaModel: String {
+        didSet { defaults.set(ollamaModel, forKey: Keys.ollamaModel) }
+    }
 
     private init() {
         isSetupComplete = defaults.data(forKey: Keys.baseFolderBookmark) != nil
@@ -67,6 +71,7 @@ final class AppSettings: ObservableObject {
         language = TranscriptionLanguage(rawValue: raw) ?? .auto
         let engineRaw = defaults.string(forKey: Keys.engine) ?? TranscriptionEngine.apple.rawValue
         engine = TranscriptionEngine(rawValue: engineRaw) ?? .apple
+        ollamaModel = defaults.string(forKey: Keys.ollamaModel) ?? "mistral"
     }
 
     var baseFolderPath: String? {

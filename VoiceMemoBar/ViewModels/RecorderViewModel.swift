@@ -21,6 +21,8 @@ final class RecorderViewModel: ObservableObject {
     @Published var quickNoteText = ""
     @Published var quickNotes: [(time: String, text: String)] = []
     @Published private(set) var markers: [TimeInterval] = []
+    /// Fires when the view should open the settings window.
+    @Published var openSettingsRequested = false
 
     private let audioService = AudioRecorderService()
     private let transcriptionService = TranscriptionService()
@@ -53,6 +55,10 @@ final class RecorderViewModel: ObservableObject {
         } else if state == .paused {
             resumeRecording()
         }
+    }
+
+    func requestOpenSettings() {
+        openSettingsRequested = true
     }
 
     func startRecording() {
@@ -181,7 +187,8 @@ final class RecorderViewModel: ObservableObject {
         currentNoteURL = fileURL
 
         let created = DateFormatter.createdFormatter.string(from: startDate)
-        let transcriptLink = "[Transcript](transcripts/\(dateString)-transcript.md)"
+        // Use Obsidian wiki-link syntax which survives file renames
+        let transcriptLink = "[[transcripts/\(dateString)-transcript]]"
 
         var lines: [String] = []
         lines.append("---")
@@ -203,8 +210,12 @@ final class RecorderViewModel: ObservableObject {
         lines.append("#Notes")
 
         let content = lines.joined(separator: "\n") + "\n"
-        try? content.write(to: fileURL, atomically: true, encoding: .utf8)
-        print("[RecorderViewModel] Created initial note: \(filename)")
+        do {
+            try content.write(to: fileURL, atomically: true, encoding: .utf8)
+            print("[RecorderViewModel] Created initial note: \(filename)")
+        } catch {
+            errorMessage = "Failed to create note file: \(error.localizedDescription)"
+        }
     }
 
     /// Create the transcript file with header + audio embed, but no transcript
@@ -214,9 +225,16 @@ final class RecorderViewModel: ObservableObject {
         let filename = "\(dateString)-transcript.md"
         let fileURL = transcriptsURL.appendingPathComponent(filename)
         let audioEmbed = "![[\(dateString)-recording.m4a]]"
-        let content = "#transcript\n\n\(audioEmbed)\n\n"
-        try? content.write(to: fileURL, atomically: true, encoding: .utf8)
-        print("[RecorderViewModel] Created initial transcript: \(filename)")
+        // Include a backlink to the note (placeholder slug); will be updated
+        // after title generation in updateTranscriptBacklink.
+        let backlink = "Source: [[\(dateString)-note]]"
+        let content = "#transcript\n\n\(backlink)\n\n\(audioEmbed)\n\n"
+        do {
+            try content.write(to: fileURL, atomically: true, encoding: .utf8)
+            print("[RecorderViewModel] Created initial transcript: \(filename)")
+        } catch {
+            errorMessage = "Failed to create transcript file: \(error.localizedDescription)"
+        }
     }
 
     // MARK: - Live Quicknote Append
@@ -268,7 +286,7 @@ final class RecorderViewModel: ObservableObject {
             if exported {
                 m4aURL = dest
             } else {
-                print("[RecorderViewModel] M4A export failed")
+                errorMessage = "Audio export failed — the .caf recording is preserved."
             }
         }
 
@@ -302,7 +320,7 @@ final class RecorderViewModel: ObservableObject {
                     segments = try await transcriptionService.transcribe(fileURL: audioURL, locale: locale)
                 }
             } catch {
-                print("[RecorderViewModel] Transcription failed: \(error.localizedDescription)")
+                errorMessage = "Transcription failed: \(error.localizedDescription)"
             }
         }
 
@@ -318,8 +336,11 @@ final class RecorderViewModel: ObservableObject {
 
             // Step 3b: LLM correction — fix misheard words while preserving ==markers==
             if await ollamaService.isAvailable() {
-                if let corrected = try? await ollamaService.correctTranscript(transcript) {
+                do {
+                    let corrected = try await ollamaService.correctTranscript(transcript)
                     transcript = corrected
+                } catch {
+                    print("[RecorderViewModel] LLM correction failed (using raw transcript): \(error.localizedDescription)")
                 }
             }
         }
@@ -330,12 +351,17 @@ final class RecorderViewModel: ObservableObject {
         // Step 5: Generate title and rename note file
         var titleSlug = "note"
         if !segments.isEmpty, await ollamaService.isAvailable() {
-            if let generated = try? await ollamaService.generateTitle(from: transcript, locale: usedLocale) {
+            do {
+                let generated = try await ollamaService.generateTitle(from: transcript, locale: usedLocale)
                 titleSlug = generated
+            } catch {
+                print("[RecorderViewModel] Title generation failed (using default): \(error.localizedDescription)")
             }
         }
         if titleSlug != "note" {
             renameNoteFile(dateString: dateString, newSlug: titleSlug)
+            // Update the transcript's backlink to point to the renamed note
+            updateTranscriptBacklink(dateString: dateString, noteSlug: titleSlug)
         }
 
         state = .idle
@@ -350,10 +376,38 @@ final class RecorderViewModel: ObservableObject {
         guard let transcriptsURL = AppSettings.shared.transcriptsURL else { return }
         let filename = "\(dateString)-transcript.md"
         let fileURL = transcriptsURL.appendingPathComponent(filename)
+
+        // Read existing content to preserve the backlink line
+        let existingContent = (try? String(contentsOf: fileURL, encoding: .utf8)) ?? ""
+
+        // Extract the Source backlink line if present
+        let lines = existingContent.components(separatedBy: "\n")
+        let backlink = lines.first(where: { $0.hasPrefix("Source: ") }) ?? "Source: [[\(dateString)-note]]"
+
         let audioEmbed = "![[\(dateString)-recording.m4a]]"
-        let content = "#transcript\n\n\(audioEmbed)\n\n\(transcript)\n"
+        let content = "#transcript\n\n\(backlink)\n\n\(audioEmbed)\n\n\(transcript)\n"
+        do {
+            try content.write(to: fileURL, atomically: true, encoding: .utf8)
+            print("[RecorderViewModel] Updated transcript with content: \(filename)")
+        } catch {
+            errorMessage = "Failed to write transcript: \(error.localizedDescription)"
+        }
+    }
+
+    /// Update the transcript file's backlink to point to the renamed note.
+    private func updateTranscriptBacklink(dateString: String, noteSlug: String) {
+        guard let transcriptsURL = AppSettings.shared.transcriptsURL else { return }
+        let filename = "\(dateString)-transcript.md"
+        let fileURL = transcriptsURL.appendingPathComponent(filename)
+
+        guard var content = try? String(contentsOf: fileURL, encoding: .utf8) else { return }
+
+        let oldBacklink = "Source: [[\(dateString)-note]]"
+        let newBacklink = "Source: [[\(dateString)-\(noteSlug)]]"
+        content = content.replacingOccurrences(of: oldBacklink, with: newBacklink)
+
         try? content.write(to: fileURL, atomically: true, encoding: .utf8)
-        print("[RecorderViewModel] Updated transcript with content: \(filename)")
+        print("[RecorderViewModel] Updated transcript backlink to: \(dateString)-\(noteSlug)")
     }
 
     /// Rename the note file from the placeholder "note" slug to the generated title.
@@ -368,9 +422,9 @@ final class RecorderViewModel: ObservableObject {
         do {
             try FileManager.default.moveItem(at: currentURL, to: newURL)
             currentNoteURL = newURL
-            print("[RecorderViewModel] Renamed note: \(currentURL.lastPathComponent) → \(newFilename)")
+            print("[RecorderViewModel] Renamed note: \(currentURL.lastPathComponent) -> \(newFilename)")
         } catch {
-            print("[RecorderViewModel] Failed to rename note: \(error.localizedDescription)")
+            errorMessage = "Failed to rename note: \(error.localizedDescription)"
         }
     }
 

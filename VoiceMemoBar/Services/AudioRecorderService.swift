@@ -1,10 +1,18 @@
 import AVFoundation
+import os
 
 final class AudioRecorderService {
     private var audioEngine: AVAudioEngine?
-    private var audioFile: AVAudioFile?
     private var tempFileURL: URL?
-    private var _isPaused = false
+
+    // All access to _audioFile must go through fileQueue.
+    private var _audioFile: AVAudioFile?
+
+    // Lock-protected pause flag — read on the real-time audio thread,
+    // written from the main thread. os_unfair_lock is the lightest
+    // correct primitive for this (no priority inversion, no syscall
+    // in the uncontended case).
+    private let pauseLock = OSAllocatedUnfairLock(initialState: false)
 
     // Serialise file writes so they finish before we release the file
     private let fileQueue = DispatchQueue(label: "record_space.audio.file")
@@ -15,9 +23,9 @@ final class AudioRecorderService {
 
     func startRecording() throws {
         // Reset state
-        _isPaused = false
+        pauseLock.withLock { $0 = false }
         tempFileURL = nil
-        audioFile = nil
+        fileQueue.sync { _audioFile = nil }
 
         let engine = AVAudioEngine()
         let inputNode = engine.inputNode
@@ -29,17 +37,35 @@ final class AudioRecorderService {
         let file = try AVAudioFile(forWriting: tempURL, settings: recordingFormat.settings)
 
         tempFileURL = tempURL
-        audioFile = file
+        fileQueue.sync { _audioFile = file }
 
         inputNode.installTap(onBus: 0, bufferSize: 4096, format: recordingFormat) { [weak self] buffer, _ in
             guard let self else { return }
-            // Capture pause state on this thread to avoid races
-            if self._isPaused { return }
-            // Serialise writes
-            self.fileQueue.async {
-                guard let file = self.audioFile else { return }
+
+            // Read pause flag safely via the lock
+            let paused = self.pauseLock.withLock { $0 }
+            if paused { return }
+
+            // Copy buffer data synchronously on the audio thread before
+            // dispatching — the engine reuses the buffer's internal storage,
+            // so the original data may be overwritten by the time the async
+            // block executes.
+            guard let copy = AVAudioPCMBuffer(pcmFormat: buffer.format, frameCapacity: buffer.frameLength) else { return }
+            copy.frameLength = buffer.frameLength
+            let channelCount = Int(buffer.format.channelCount)
+            for ch in 0..<channelCount {
+                if let src = buffer.floatChannelData?[ch],
+                   let dst = copy.floatChannelData?[ch] {
+                    memcpy(dst, src, Int(buffer.frameLength) * MemoryLayout<Float>.size)
+                }
+            }
+
+            // Serialise writes — now using the safe copy
+            self.fileQueue.async { [weak self] in
+                guard let self else { return }
+                guard let file = self._audioFile else { return }
                 do {
-                    try file.write(from: buffer)
+                    try file.write(from: copy)
                 } catch {
                     print("[AudioRecorderService] Write error: \(error.localizedDescription)")
                 }
@@ -52,16 +78,16 @@ final class AudioRecorderService {
     }
 
     func pause() {
-        _isPaused = true
+        pauseLock.withLock { $0 = true }
     }
 
     func resume() {
-        _isPaused = false
+        pauseLock.withLock { $0 = false }
     }
 
     func stop() {
         // 1. Stop accepting new buffers
-        _isPaused = true
+        pauseLock.withLock { $0 = true }
 
         // 2. Remove the tap (synchronous — no new callbacks scheduled after this)
         audioEngine?.inputNode.removeTap(onBus: 0)
@@ -70,11 +96,12 @@ final class AudioRecorderService {
         audioEngine?.stop()
         audioEngine = nil
 
-        // 4. Wait for any in-flight writes to complete (barrier on the file queue)
-        fileQueue.sync { }
-
-        // 5. Release the AVAudioFile so its destructor flushes the file header
-        audioFile = nil
+        // 4. Wait for any in-flight writes to complete, then release the file.
+        //    Setting _audioFile = nil inside the sync block ensures no concurrent
+        //    read from the tap closure can race with this assignment.
+        fileQueue.sync {
+            _audioFile = nil
+        }
 
         // Verify file exists and has data
         if let url = tempFileURL {

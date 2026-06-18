@@ -4,8 +4,6 @@ import Combine
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    static var instance: AppDelegate?
-
     private var statusItem: NSStatusItem!
     private var popover: NSPopover!
     private var hotkeyService: HotkeyService!
@@ -28,7 +26,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let menuBarIconMax: CGFloat = 22
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        AppDelegate.instance = self
         setupStatusItem()
         setupPopover()
         setupHotkeys()
@@ -125,6 +122,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .filter { $0 }
             .sink { [weak self] _ in
                 self?.showNoteDroppedFlash()
+            }
+            .store(in: &cancellables)
+
+        recorderViewModel.$openSettingsRequested
+            .filter { $0 }
+            .sink { [weak self] _ in
+                guard let self else { return }
+                self.recorderViewModel.openSettingsRequested = false
+                self.openSettingsWindow()
             }
             .store(in: &cancellables)
     }

@@ -151,7 +151,7 @@ struct RecorderView: View {
             LanguagePicker()
             Spacer()
             Button(action: {
-                AppDelegate.instance?.openSettingsWindow()
+                vm.requestOpenSettings()
             }) {
                 Image(systemName: "gearshape")
                     .font(.system(size: 10, weight: .medium))
