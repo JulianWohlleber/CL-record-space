@@ -17,6 +17,10 @@ final class AudioRecorderService {
     // Serialise file writes so they finish before we release the file
     private let fileQueue = DispatchQueue(label: "record_space.audio.file")
 
+    /// Callback for reporting current temp file size (bytes). Called on main queue.
+    var onFileSizeUpdate: ((Int64) -> Void)?
+    private var fileSizeTimer: Timer?
+
     var isRecording: Bool {
         audioEngine?.isRunning ?? false
     }
@@ -75,6 +79,26 @@ final class AudioRecorderService {
         engine.prepare()
         try engine.start()
         audioEngine = engine
+
+        // Poll temp file size every 5 seconds for the UI indicator
+        startFileSizePolling()
+    }
+
+    private func startFileSizePolling() {
+        fileSizeTimer?.invalidate()
+        fileSizeTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            guard let self, let url = self.tempFileURL else { return }
+            let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+            let size = (attrs?[.size] as? Int64) ?? 0
+            DispatchQueue.main.async { [weak self] in
+                self?.onFileSizeUpdate?(size)
+            }
+        }
+    }
+
+    private func stopFileSizePolling() {
+        fileSizeTimer?.invalidate()
+        fileSizeTimer = nil
     }
 
     func pause() {
@@ -86,6 +110,8 @@ final class AudioRecorderService {
     }
 
     func stop() {
+        stopFileSizePolling()
+
         // 1. Stop accepting new buffers
         pauseLock.withLock { $0 = true }
 

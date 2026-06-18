@@ -48,6 +48,7 @@ struct RecorderView: View {
             // Timer header
             HStack(spacing: 8) {
                 PulsingDot(color: vm.state == .paused ? .orange : .red)
+                    .accessibilityHidden(true)
 
                 Text(vm.formattedTime)
                     .font(.system(size: 12, weight: .medium, design: .monospaced))
@@ -63,6 +64,14 @@ struct RecorderView: View {
 
                 Spacer()
 
+                // File size indicator
+                if !vm.formattedFileSize.isEmpty {
+                    Text(vm.formattedFileSize)
+                        .font(.system(size: 9, weight: .medium, design: .monospaced))
+                        .foregroundStyle(vm.fileSizeStalled ? .orange.opacity(0.7) : .primary.opacity(0.3))
+                        .accessibilityLabel("Recording file size: \(vm.formattedFileSize)")
+                }
+
                 if !vm.markers.isEmpty {
                     Text("\(vm.markers.count)")
                         .font(.system(size: 9, weight: .semibold, design: .monospaced))
@@ -75,7 +84,17 @@ struct RecorderView: View {
             }
             .padding(.horizontal, 16)
             .padding(.top, 12)
-            .padding(.bottom, 10)
+            .padding(.bottom, vm.markers.isEmpty ? 10 : 4)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(vm.state == .paused ? "Recording paused" : "Recording in progress")
+            .accessibilityValue(vm.formattedTime + (vm.markers.isEmpty ? "" : ", \(vm.markers.count) markers"))
+
+            // Marker timeline
+            if !vm.markers.isEmpty {
+                MarkerTimeline(markers: vm.markers, elapsedTime: vm.elapsedTime)
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 6)
+            }
 
             ThinDivider()
 
@@ -155,11 +174,12 @@ struct RecorderView: View {
             }) {
                 Image(systemName: "gearshape")
                     .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(.primary.opacity(0.15))
+                    .foregroundStyle(.primary.opacity(0.45))
             }
             .buttonStyle(SubtleButtonStyle())
+            .accessibilityLabel("Settings")
         }
-        .padding(.horizontal, 14)
+        .padding(.horizontal, 16)
         .padding(.top, 2)
         .padding(.bottom, 8)
     }
@@ -183,6 +203,7 @@ struct ActionRow: View {
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(iconColor)
                     .frame(width: 16)
+                    .accessibilityHidden(true)
 
                 Text(label)
                     .font(.system(size: 12.5, weight: .regular))
@@ -191,6 +212,7 @@ struct ActionRow: View {
                 Spacer()
 
                 ShortcutLabel(shortcut)
+                    .accessibilityHidden(true)
             }
             .contentShape(Rectangle())
             .padding(.horizontal, 16)
@@ -199,6 +221,8 @@ struct ActionRow: View {
         }
         .buttonStyle(.plain)
         .onHover { isHovered = $0 }
+        .accessibilityLabel(label)
+        .accessibilityHint("Keyboard shortcut: \(shortcut)")
     }
 }
 
@@ -209,7 +233,7 @@ struct ShortcutLabel: View {
     var body: some View {
         Text(text)
             .font(.system(size: 9, weight: .medium, design: .monospaced))
-            .foregroundStyle(.primary.opacity(0.15))
+            .foregroundStyle(.primary.opacity(0.4))
     }
 }
 
@@ -218,7 +242,7 @@ struct ThinDivider: View {
         Rectangle()
             .fill(.primary.opacity(0.06))
             .frame(height: 0.5)
-            .padding(.horizontal, 14)
+            .padding(.horizontal, 16)
     }
 }
 
@@ -273,12 +297,63 @@ private struct LanguagePill: View {
         Button(action: action) {
             Text(label)
                 .font(.system(size: 9, weight: .medium, design: .monospaced))
-                .foregroundStyle(.primary.opacity(selected ? 0.6 : 0.2))
+                .foregroundStyle(.primary.opacity(selected ? 0.6 : 0.45))
                 .padding(.horizontal, 5)
                 .padding(.vertical, 2)
                 .background(selected ? Color.primary.opacity(0.08) : Color.clear)
                 .clipShape(RoundedRectangle(cornerRadius: 3))
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(label)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+        .accessibilityHint("Language option")
+    }
+}
+
+// MARK: - Marker Timeline
+
+struct MarkerTimeline: View {
+    let markers: [TimeInterval]
+    let elapsedTime: TimeInterval
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            // Timeline bar with tick marks
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    // Background bar
+                    RoundedRectangle(cornerRadius: 1)
+                        .fill(.primary.opacity(0.06))
+                        .frame(height: 2)
+
+                    // Marker ticks
+                    ForEach(Array(markers.enumerated()), id: \.offset) { _, time in
+                        let fraction = elapsedTime > 0 ? CGFloat(time / elapsedTime) : 0
+                        RoundedRectangle(cornerRadius: 0.5)
+                            .fill(.orange.opacity(0.7))
+                            .frame(width: 2, height: 6)
+                            .offset(x: fraction * (geo.size.width - 2))
+                    }
+                }
+                .frame(height: 6)
+            }
+            .frame(height: 6)
+
+            // Last marker timestamp
+            if let last = markers.last {
+                Text("@ \(Self.formatTimestamp(last))")
+                    .font(.system(size: 9, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.orange.opacity(0.5))
+            }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(markers.count) markers placed")
+        .accessibilityValue(markers.last.map { "Last marker at \(Self.formatTimestamp($0))" } ?? "")
+    }
+
+    static func formatTimestamp(_ time: TimeInterval) -> String {
+        let minutes = Int(time) / 60
+        let seconds = Int(time) % 60
+        return String(format: "%02d:%02d", minutes, seconds)
     }
 }

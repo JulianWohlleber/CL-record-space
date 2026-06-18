@@ -24,6 +24,20 @@ final class RecorderViewModel: ObservableObject {
     /// Fires when the view should open the settings window.
     @Published var openSettingsRequested = false
 
+    /// Current transcription pipeline phase label shown in TranscribingView.
+    @Published var transcriptionPhase: String = "Finalizing transcript"
+    /// Index of the current transcription phase (0-4) for progress indication.
+    @Published var transcriptionPhaseIndex: Int = 0
+    /// Total number of transcription phases.
+    let transcriptionPhaseCount: Int = 5
+
+    /// Formatted file size of the current recording temp file.
+    @Published var formattedFileSize: String = ""
+    /// True when the file size hasn't grown for more than 10 seconds while recording.
+    @Published var fileSizeStalled: Bool = false
+    private var lastFileSize: Int64 = 0
+    private var fileSizeStalledCount: Int = 0
+
     private let audioService = AudioRecorderService()
     private let transcriptionService = TranscriptionService()
     private let whisperService = WhisperTranscriptionService()
@@ -83,11 +97,23 @@ final class RecorderViewModel: ObservableObject {
             recordingStartDate = startDate
 
             do {
+                // Wire up file size reporting before starting
+                audioService.onFileSizeUpdate = { [weak self] bytes in
+                    Task { @MainActor in
+                        guard let self else { return }
+                        self.updateFileSize(bytes)
+                    }
+                }
+
                 try audioService.startRecording()
                 state = .recording
                 elapsedTime = 0
                 markers = []
                 quickNotes = []
+                formattedFileSize = ""
+                fileSizeStalled = false
+                lastFileSize = 0
+                fileSizeStalledCount = 0
                 errorMessage = nil
                 startTimer()
 
@@ -279,6 +305,8 @@ final class RecorderViewModel: ObservableObject {
         let dateString = currentDateString ?? DateFormatter.filenameFormatter.string(from: startDate)
 
         // Step 1: Export audio to .m4a
+        transcriptionPhase = "Exporting audio"
+        transcriptionPhaseIndex = 0
         var m4aURL: URL?
         if let recordingsURL = AppSettings.shared.recordingsURL {
             let dest = recordingsURL.appendingPathComponent("\(dateString)-recording.m4a")
@@ -291,6 +319,8 @@ final class RecorderViewModel: ObservableObject {
         }
 
         // Step 2: Resolve the locale (auto-detect or user preference)
+        transcriptionPhase = "Detecting language"
+        transcriptionPhaseIndex = 1
         var segments: [TimedSegment] = []
         var usedLocale = Locale(identifier: "en-US")
 
@@ -310,6 +340,10 @@ final class RecorderViewModel: ObservableObject {
                 print("[RecorderViewModel] Apple auto-detected locale: \(locale.identifier)")
             }
             usedLocale = locale
+
+            // Step 3: Transcribe
+            transcriptionPhase = "Transcribing"
+            transcriptionPhaseIndex = 2
 
             do {
                 if enginePref == .whisper && whisperService.isReady {
@@ -335,6 +369,8 @@ final class RecorderViewModel: ObservableObject {
             transcript = TranscriptionService.applyMarkers(to: segments, markers: markers)
 
             // Step 3b: LLM correction — fix misheard words while preserving ==markers==
+            transcriptionPhase = "Correcting transcript"
+            transcriptionPhaseIndex = 3
             if await ollamaService.isAvailable() {
                 do {
                     let corrected = try await ollamaService.correctTranscript(transcript)
@@ -349,6 +385,8 @@ final class RecorderViewModel: ObservableObject {
         updateTranscriptFile(dateString: dateString, transcript: transcript)
 
         // Step 5: Generate title and rename note file
+        transcriptionPhase = "Generating title"
+        transcriptionPhaseIndex = 4
         var titleSlug = "note"
         if !segments.isEmpty, await ollamaService.isAvailable() {
             do {
@@ -425,6 +463,26 @@ final class RecorderViewModel: ObservableObject {
             print("[RecorderViewModel] Renamed note: \(currentURL.lastPathComponent) -> \(newFilename)")
         } catch {
             errorMessage = "Failed to rename note: \(error.localizedDescription)"
+        }
+    }
+
+    private func updateFileSize(_ bytes: Int64) {
+        if bytes == lastFileSize && state == .recording {
+            fileSizeStalledCount += 1
+            // 5s polling * 2 = 10s stall threshold
+            fileSizeStalled = fileSizeStalledCount >= 2
+        } else {
+            fileSizeStalledCount = 0
+            fileSizeStalled = false
+        }
+        lastFileSize = bytes
+
+        if bytes < 1024 {
+            formattedFileSize = "\(bytes) B"
+        } else if bytes < 1024 * 1024 {
+            formattedFileSize = String(format: "%.0f KB", Double(bytes) / 1024)
+        } else {
+            formattedFileSize = String(format: "%.1f MB", Double(bytes) / (1024 * 1024))
         }
     }
 

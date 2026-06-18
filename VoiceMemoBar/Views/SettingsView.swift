@@ -86,7 +86,7 @@ struct SettingsView: View {
                 .pickerStyle(.segmented)
                 .frame(width: 160)
             }
-            .padding(.vertical, 6)
+            .padding(.vertical, 10)
 
             SettingsDivider()
                 .padding(.top, 4)
