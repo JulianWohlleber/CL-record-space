@@ -1,0 +1,41 @@
+name: VoiceMemoBar
+options:
+  bundleIdPrefix: com.voicememobar
+  deploymentTarget:
+    macOS: "14.0"
+  xcodeVersion: "16.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+packages:
+  WhisperKit:
+    url: https://github.com/argmaxinc/WhisperKit
+    from: "0.9.0"
+targets:
+  VoiceMemoBar:
+    type: application
+    platform: macOS
+    sources:
+      - VoiceMemoBar
+    dependencies:
+      - package: WhisperKit
+        product: WhisperKit
+    settings:
+      base:
+        INFOPLIST_FILE: VoiceMemoBar/Info.plist
+        CODE_SIGN_ENTITLEMENTS: VoiceMemoBar/VoiceMemoBar.entitlements
+        PRODUCT_BUNDLE_IDENTIFIER: com.voicememobar.app
+        PRODUCT_NAME: record_space
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        LD_RUNPATH_SEARCH_PATHS: "@executable_path/../Frameworks"
+        ENABLE_HARDENED_RUNTIME: true
+    info:
+      path: VoiceMemoBar/Info.plist
+      properties:
+        LSUIElement: true
+        NSMicrophoneUsageDescription: "record_space needs microphone access to record voice memos."
+        NSSpeechRecognitionUsageDescription: "record_space uses speech recognition to transcribe your recordings."
+        ATSApplicationFontsPath: "."
+        CFBundleName: record_space
+        CFBundleDisplayName: record_space

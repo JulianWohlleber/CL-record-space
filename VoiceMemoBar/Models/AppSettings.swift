@@ -1,0 +1,136 @@
+import Foundation
+import Combine
+
+enum TranscriptionEngine: String, CaseIterable, Identifiable {
+    case apple = "apple"
+    case whisper = "whisper"
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .apple: return "Apple (fast)"
+        case .whisper: return "Whisper (accurate)"
+        }
+    }
+}
+
+enum TranscriptionLanguage: String, CaseIterable, Identifiable {
+    case auto = "auto"
+    case english = "en-US"
+    case german = "de-DE"
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .auto: return "Auto"
+        case .english: return "EN"
+        case .german: return "DE"
+        }
+    }
+
+    var locale: Locale? {
+        switch self {
+        case .auto: return nil
+        case .english: return Locale(identifier: "en-US")
+        case .german: return Locale(identifier: "de-DE")
+        }
+    }
+}
+
+@MainActor
+final class AppSettings: ObservableObject {
+    static let shared = AppSettings()
+
+    private let defaults = UserDefaults.standard
+    private var scopedURL: URL?
+
+    private enum Keys {
+        static let baseFolderPath = "baseFolderPath"
+        static let baseFolderBookmark = "baseFolderBookmark"
+        static let language = "language"
+        static let engine = "transcriptionEngine"
+    }
+
+    @Published var isSetupComplete: Bool = false
+    @Published var language: TranscriptionLanguage {
+        didSet { defaults.set(language.rawValue, forKey: Keys.language) }
+    }
+    @Published var engine: TranscriptionEngine {
+        didSet { defaults.set(engine.rawValue, forKey: Keys.engine) }
+    }
+
+    private init() {
+        isSetupComplete = defaults.data(forKey: Keys.baseFolderBookmark) != nil
+        let raw = defaults.string(forKey: Keys.language) ?? TranscriptionLanguage.auto.rawValue
+        language = TranscriptionLanguage(rawValue: raw) ?? .auto
+        let engineRaw = defaults.string(forKey: Keys.engine) ?? TranscriptionEngine.apple.rawValue
+        engine = TranscriptionEngine(rawValue: engineRaw) ?? .apple
+    }
+
+    var baseFolderPath: String? {
+        defaults.string(forKey: Keys.baseFolderPath)
+    }
+
+    private var baseFolderBookmark: Data? {
+        defaults.data(forKey: Keys.baseFolderBookmark)
+    }
+
+    /// Save a folder URL from NSOpenPanel (which has implicit security scope).
+    func saveBaseFolder(_ url: URL) {
+        defaults.set(url.path, forKey: Keys.baseFolderPath)
+        do {
+            let bookmark = try url.bookmarkData(
+                options: .withSecurityScope,
+                includingResourceValuesForKeys: nil,
+                relativeTo: nil
+            )
+            defaults.set(bookmark, forKey: Keys.baseFolderBookmark)
+            isSetupComplete = true
+        } catch {
+            print("Failed to create bookmark: \(error)")
+        }
+    }
+
+    /// Resolve the security-scoped bookmark and start accessing. Call once, cache result.
+    func accessBaseFolder() -> URL? {
+        // Return cached URL if already accessing
+        if let scopedURL { return scopedURL }
+
+        guard let bookmarkData = baseFolderBookmark else { return nil }
+        var isStale = false
+        guard let url = try? URL(
+            resolvingBookmarkData: bookmarkData,
+            options: .withSecurityScope,
+            relativeTo: nil,
+            bookmarkDataIsStale: &isStale
+        ) else { return nil }
+
+        if isStale {
+            // Re-save the bookmark from the resolved URL
+            saveBaseFolder(url)
+        }
+
+        guard url.startAccessingSecurityScopedResource() else { return nil }
+        scopedURL = url
+        return url
+    }
+
+    func stopAccessingBaseFolder() {
+        scopedURL?.stopAccessingSecurityScopedResource()
+        scopedURL = nil
+    }
+
+    var recordingsURL: URL? {
+        accessBaseFolder()?.appendingPathComponent("recordings")
+    }
+
+    var transcriptsURL: URL? {
+        accessBaseFolder()?.appendingPathComponent("transcripts")
+    }
+
+    var vaultRootURL: URL? {
+        accessBaseFolder()
+    }
+}
