@@ -76,6 +76,9 @@ final class RecorderViewModel: ObservableObject {
     }
 
     func startRecording() {
+        // Prevent double-start if a recording is already in progress
+        guard state == .idle else { return }
+
         guard AppSettings.shared.isSetupComplete else {
             errorMessage = "Please set up your vault folder first."
             return
@@ -88,8 +91,31 @@ final class RecorderViewModel: ObservableObject {
                 return
             }
 
-            guard AppSettings.shared.recordingsURL != nil else {
+            // Re-check state after async permission request (another start may have raced)
+            guard state == .idle else { return }
+
+            guard let recordingsURL = AppSettings.shared.recordingsURL else {
                 errorMessage = "Vault folder not accessible."
+                return
+            }
+
+            // Ensure vault subdirectories exist
+            let fm = FileManager.default
+            do {
+                try fm.createDirectory(at: recordingsURL, withIntermediateDirectories: true)
+                if let transcriptsURL = AppSettings.shared.transcriptsURL {
+                    try fm.createDirectory(at: transcriptsURL, withIntermediateDirectories: true)
+                }
+            } catch {
+                errorMessage = "Cannot create vault folders: \(error.localizedDescription)"
+                return
+            }
+
+            // Check available disk space (require at least 50 MB to start)
+            if let attrs = try? fm.attributesOfFileSystem(forPath: recordingsURL.path),
+               let freeSpace = attrs[.systemFreeSize] as? Int64,
+               freeSpace < 50 * 1024 * 1024 {
+                errorMessage = "Not enough disk space to record (less than 50 MB free)."
                 return
             }
 
@@ -107,8 +133,9 @@ final class RecorderViewModel: ObservableObject {
 
                 // Handle unexpected audio engine stop (e.g. mic disconnected)
                 audioService.onUnexpectedStop = { [weak self] in
-                    guard let self else { return }
-                    if self.state == .recording || self.state == .paused {
+                    Task { @MainActor in
+                        guard let self else { return }
+                        guard self.state == .recording || self.state == .paused else { return }
                         self.errorMessage = "Microphone disconnected — saving recording."
                         self.stopRecording()
                     }
@@ -139,29 +166,37 @@ final class RecorderViewModel: ObservableObject {
     }
 
     func pauseRecording() {
+        guard state == .recording else { return }
         audioService.pause()
         state = .paused
         stopTimer()
     }
 
     func resumeRecording() {
+        guard state == .paused else { return }
         audioService.resume()
         state = .recording
         startTimer()
     }
 
     func stopRecording() {
+        guard state == .recording || state == .paused else { return }
+
         audioService.stop()
         stopTimer()
+        markerActiveTimer?.invalidate()
+        markerActiveTimer = nil
         state = .transcribing
 
         guard let startDate = recordingStartDate else {
+            resetSessionState()
             state = .idle
             return
         }
 
-        let savedMarkers = markers
-        let savedQuickNotes = quickNotes
+        // Snapshot mutable arrays before entering async processing
+        let savedMarkers = Array(markers)
+        let savedQuickNotes = quickNotes.map { (time: $0.time, text: $0.text) }
 
         Task {
             await processRecording(
@@ -216,7 +251,17 @@ final class RecorderViewModel: ObservableObject {
     /// Create the note file with skeleton content. Uses placeholder slug "note"
     /// which will be renamed after title generation.
     private func createInitialNoteFile(dateString: String, startDate: Date) {
-        guard let vaultURL = AppSettings.shared.vaultRootURL else { return }
+        guard let vaultURL = AppSettings.shared.vaultRootURL else {
+            errorMessage = "Vault folder not accessible."
+            return
+        }
+
+        // Verify vault directory still exists on disk
+        guard FileManager.default.fileExists(atPath: vaultURL.path) else {
+            errorMessage = "Vault folder has been moved or deleted."
+            return
+        }
+
         let filename = "\(dateString)-note.md"
         let fileURL = vaultURL.appendingPathComponent(filename)
         currentNoteURL = fileURL
@@ -256,7 +301,13 @@ final class RecorderViewModel: ObservableObject {
     /// Create the transcript file with header + audio embed, but no transcript
     /// content yet. The transcript will be filled in after transcription.
     private func createInitialTranscriptFile(dateString: String) {
-        guard let transcriptsURL = AppSettings.shared.transcriptsURL else { return }
+        guard let transcriptsURL = AppSettings.shared.transcriptsURL else {
+            errorMessage = "Transcripts folder not accessible."
+            return
+        }
+
+        // Ensure the transcripts directory exists
+        try? FileManager.default.createDirectory(at: transcriptsURL, withIntermediateDirectories: true)
         let filename = "\(dateString)-transcript.md"
         let fileURL = transcriptsURL.appendingPathComponent(filename)
         let audioEmbed = "![[\(dateString)-recording.m4a]]"
@@ -277,8 +328,21 @@ final class RecorderViewModel: ObservableObject {
     /// Append a single quicknote line to the existing note file on disk,
     /// inserting it right before the empty line after "## Quicknotes".
     private func appendQuickNoteToFile(time: String, text: String) {
-        guard let noteURL = currentNoteURL else { return }
-        guard let existing = try? String(contentsOf: noteURL, encoding: .utf8) else { return }
+        guard let noteURL = currentNoteURL else {
+            print("[RecorderViewModel] No note file URL, cannot append quicknote")
+            return
+        }
+
+        // Verify the note file still exists (vault may have been moved)
+        guard FileManager.default.fileExists(atPath: noteURL.path) else {
+            print("[RecorderViewModel] Note file no longer exists at \(noteURL.path)")
+            return
+        }
+
+        guard let existing = try? String(contentsOf: noteURL, encoding: .utf8) else {
+            print("[RecorderViewModel] Could not read note file for quicknote append")
+            return
+        }
 
         let noteLine = "\(time) \(text)"
 
@@ -301,7 +365,11 @@ final class RecorderViewModel: ObservableObject {
         }
 
         let updated = lines.joined(separator: "\n")
-        try? updated.write(to: noteURL, atomically: true, encoding: .utf8)
+        do {
+            try updated.write(to: noteURL, atomically: true, encoding: .utf8)
+        } catch {
+            print("[RecorderViewModel] Failed to write quicknote: \(error.localizedDescription)")
+        }
     }
 
     // MARK: - Processing Pipeline (runs after recording stops)
@@ -311,7 +379,17 @@ final class RecorderViewModel: ObservableObject {
         markers: [TimeInterval],
         quickNotes: [(time: String, text: String)]
     ) async {
+        // Always reset session state when done, regardless of success or failure
+        defer { resetSessionState() }
+
         let dateString = currentDateString ?? DateFormatter.filenameFormatter.string(from: startDate)
+
+        // Re-verify vault is still accessible (folder may have been moved/deleted)
+        guard AppSettings.shared.vaultRootURL != nil else {
+            errorMessage = "Vault folder is no longer accessible."
+            audioService.cleanupTemp()
+            return
+        }
 
         // Step 1: Export audio to .m4a
         transcriptionPhase = "Exporting audio"
@@ -411,10 +489,7 @@ final class RecorderViewModel: ObservableObject {
             updateTranscriptBacklink(dateString: dateString, noteSlug: titleSlug)
         }
 
-        state = .idle
-        recordingStartDate = nil
-        currentDateString = nil
-        currentNoteURL = nil
+        // State cleanup is handled by the defer/resetSessionState above
     }
 
     /// Update the existing transcript file with actual transcript content.
@@ -463,13 +538,28 @@ final class RecorderViewModel: ObservableObject {
         guard let vaultURL = AppSettings.shared.vaultRootURL else { return }
         guard let currentURL = currentNoteURL else { return }
 
+        // Verify source file still exists (vault folder may have been moved)
+        guard FileManager.default.fileExists(atPath: currentURL.path) else {
+            print("[RecorderViewModel] Source note file no longer exists, skipping rename")
+            return
+        }
+
         let newFilename = "\(dateString)-\(newSlug).md"
         let newURL = vaultURL.appendingPathComponent(newFilename)
 
+        // If destination already exists, append a suffix to avoid collision
+        let fm = FileManager.default
+        var finalURL = newURL
+        if fm.fileExists(atPath: newURL.path) {
+            let deduped = "\(dateString)-\(newSlug)-\(Int(Date().timeIntervalSince1970)).md"
+            finalURL = vaultURL.appendingPathComponent(deduped)
+            print("[RecorderViewModel] Destination exists, using deduped name: \(deduped)")
+        }
+
         do {
-            try FileManager.default.moveItem(at: currentURL, to: newURL)
-            currentNoteURL = newURL
-            print("[RecorderViewModel] Renamed note: \(currentURL.lastPathComponent) -> \(newFilename)")
+            try fm.moveItem(at: currentURL, to: finalURL)
+            currentNoteURL = finalURL
+            print("[RecorderViewModel] Renamed note: \(currentURL.lastPathComponent) -> \(finalURL.lastPathComponent)")
         } catch {
             errorMessage = "Failed to rename note: \(error.localizedDescription)"
         }
@@ -493,6 +583,18 @@ final class RecorderViewModel: ObservableObject {
         } else {
             formattedFileSize = String(format: "%.1f MB", Double(bytes) / (1024 * 1024))
         }
+    }
+
+    // MARK: - Session State Cleanup
+
+    /// Reset all per-session state back to idle. Called from processRecording's
+    /// defer block and from stopRecording's early return, ensuring cleanup
+    /// happens in every exit path (success, error, or cancellation).
+    private func resetSessionState() {
+        state = .idle
+        recordingStartDate = nil
+        currentDateString = nil
+        currentNoteURL = nil
     }
 
     var formattedTime: String {

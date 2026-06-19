@@ -100,8 +100,16 @@ final class AppSettings: ObservableObject {
 
     /// Resolve the security-scoped bookmark and start accessing. Call once, cache result.
     func accessBaseFolder() -> URL? {
-        // Return cached URL if already accessing
-        if let scopedURL { return scopedURL }
+        // Return cached URL if already accessing — but verify it still exists on disk
+        if let scopedURL {
+            if FileManager.default.fileExists(atPath: scopedURL.path) {
+                return scopedURL
+            }
+            // Folder was moved/deleted — drop the cached reference and re-resolve
+            scopedURL.stopAccessingSecurityScopedResource()
+            self.scopedURL = nil
+            print("[AppSettings] Cached vault URL no longer valid, re-resolving bookmark")
+        }
 
         guard let bookmarkData = baseFolderBookmark else { return nil }
         var isStale = false
@@ -110,14 +118,29 @@ final class AppSettings: ObservableObject {
             options: .withSecurityScope,
             relativeTo: nil,
             bookmarkDataIsStale: &isStale
-        ) else { return nil }
+        ) else {
+            print("[AppSettings] Bookmark resolution failed — vault may have been moved")
+            return nil
+        }
 
         if isStale {
             // Re-save the bookmark from the resolved URL
+            print("[AppSettings] Bookmark is stale, refreshing")
             saveBaseFolder(url)
         }
 
-        guard url.startAccessingSecurityScopedResource() else { return nil }
+        guard url.startAccessingSecurityScopedResource() else {
+            print("[AppSettings] Failed to start accessing security-scoped resource")
+            return nil
+        }
+
+        // Final check: does the resolved path actually exist?
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            url.stopAccessingSecurityScopedResource()
+            print("[AppSettings] Resolved URL does not exist on disk: \(url.path)")
+            return nil
+        }
+
         scopedURL = url
         return url
     }
