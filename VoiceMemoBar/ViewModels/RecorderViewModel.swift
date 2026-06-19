@@ -532,11 +532,39 @@ final class RecorderViewModel: ObservableObject {
         print("[RecorderViewModel] Updated transcript backlink to: \(dateString)-\(noteSlug)")
     }
 
+    /// Sanitize a slug from LLM output: strip path-traversal sequences,
+    /// control characters, and enforce a length limit. Defense-in-depth —
+    /// OllamaService already filters, but we don't trust upstream fully.
+    private func sanitizeSlug(_ raw: String) -> String {
+        let safe = raw
+            .replacingOccurrences(of: "..", with: "")
+            .replacingOccurrences(of: "/", with: "")
+            .replacingOccurrences(of: "\\", with: "")
+            .filter { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-") }
+            .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+            .replacingOccurrences(of: "--+", with: "-", options: .regularExpression)
+
+        // Hard cap at 60 characters
+        if safe.count <= 60 { return safe }
+        let truncated = String(safe.prefix(60))
+        if let lastHyphen = truncated.lastIndex(of: "-") {
+            return String(truncated[truncated.startIndex..<lastHyphen])
+        }
+        return truncated
+    }
+
     /// Rename the note file from the placeholder "note" slug to the generated title.
     /// Obsidian handles file renames gracefully.
     private func renameNoteFile(dateString: String, newSlug: String) {
         guard let vaultURL = AppSettings.shared.vaultRootURL else { return }
         guard let currentURL = currentNoteURL else { return }
+
+        // Defense-in-depth: re-sanitize the slug before using it in a path
+        let slug = sanitizeSlug(newSlug)
+        guard !slug.isEmpty else {
+            print("[RecorderViewModel] Slug sanitized to empty, skipping rename")
+            return
+        }
 
         // Verify source file still exists (vault folder may have been moved)
         guard FileManager.default.fileExists(atPath: currentURL.path) else {
@@ -544,14 +572,14 @@ final class RecorderViewModel: ObservableObject {
             return
         }
 
-        let newFilename = "\(dateString)-\(newSlug).md"
+        let newFilename = "\(dateString)-\(slug).md"
         let newURL = vaultURL.appendingPathComponent(newFilename)
 
         // If destination already exists, append a suffix to avoid collision
         let fm = FileManager.default
         var finalURL = newURL
         if fm.fileExists(atPath: newURL.path) {
-            let deduped = "\(dateString)-\(newSlug)-\(Int(Date().timeIntervalSince1970)).md"
+            let deduped = "\(dateString)-\(slug)-\(Int(Date().timeIntervalSince1970)).md"
             finalURL = vaultURL.appendingPathComponent(deduped)
             print("[RecorderViewModel] Destination exists, using deduped name: \(deduped)")
         }

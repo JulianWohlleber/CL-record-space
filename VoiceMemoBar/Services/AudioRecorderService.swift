@@ -290,7 +290,16 @@ final class AudioRecorderService {
     }
 
     deinit {
+        // Full cleanup: stop polling, remove observer, stop engine, drain writes
+        fileSizeTimer?.invalidate()
+        fileSizeTimer = nil
         removeConfigObserver()
+        if let engine = audioEngine {
+            engine.inputNode.removeTap(onBus: 0)
+            if engine.isRunning { engine.stop() }
+        }
+        audioEngine = nil
+        fileQueue.sync { _audioFile = nil }
     }
 }
 

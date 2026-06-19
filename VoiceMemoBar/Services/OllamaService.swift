@@ -3,6 +3,18 @@ import Foundation
 final class OllamaService {
     private let baseURL = "http://localhost:11434"
 
+    /// Dedicated URLSession with ephemeral configuration — no persistent
+    /// caches or cookies for local LLM requests. Connection pooling is
+    /// handled automatically by URLSession; httpMaximumConnectionsPerHost
+    /// is capped at 2 since all requests go to the same localhost endpoint.
+    private let session: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.httpMaximumConnectionsPerHost = 2
+        config.timeoutIntervalForResource = 180  // hard cap for long LLM generation
+        config.waitsForConnectivity = false       // fail fast if Ollama isn't running
+        return URLSession(configuration: config)
+    }()
+
     /// Resolved model name — reads from AppSettings on each call so changes
     /// take effect immediately without restarting.
     private var model: String {
@@ -138,10 +150,23 @@ final class OllamaService {
             .replacingOccurrences(of: "--+", with: "-", options: .regularExpression)
 
         guard !cleaned.isEmpty else { throw OllamaError.invalidResponse }
+
+        // Security: the .filter above already strips "/" and "." (only ASCII
+        // letters, digits, and "-" survive), but as defense-in-depth we
+        // explicitly reject path-traversal patterns and control characters.
+        // This guards against future refactors that might loosen the filter.
+        let sanitized = cleaned
+            .replacingOccurrences(of: "..", with: "")
+            .replacingOccurrences(of: "/", with: "")
+            .replacingOccurrences(of: "\\", with: "")
+            .filter { !$0.isNewline && $0.asciiValue.map({ $0 >= 32 }) ?? false }
+
+        guard !sanitized.isEmpty else { throw OllamaError.invalidResponse }
+
         // Cap at 60 chars — trim on a hyphen boundary if possible so we don't
         // produce a truncated word.
-        if cleaned.count <= 60 { return cleaned }
-        let truncated = String(cleaned.prefix(60))
+        if sanitized.count <= 60 { return sanitized }
+        let truncated = String(sanitized.prefix(60))
         if let lastHyphen = truncated.lastIndex(of: "-") {
             return String(truncated[truncated.startIndex..<lastHyphen])
         }
@@ -154,7 +179,7 @@ final class OllamaService {
         var request = URLRequest(url: url)
         request.timeoutInterval = 5  // Quick check — don't wait long
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await session.data(for: request)
             guard (response as? HTTPURLResponse)?.statusCode == 200 else { return false }
 
             // Verify the configured model is actually pulled
@@ -195,7 +220,7 @@ final class OllamaService {
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await URLSession.shared.data(for: request)
+            (data, response) = try await session.data(for: request)
         } catch let urlError as URLError {
             switch urlError.code {
             case .timedOut:
@@ -221,6 +246,10 @@ final class OllamaService {
         }
 
         return data
+    }
+
+    deinit {
+        session.invalidateAndCancel()
     }
 }
 

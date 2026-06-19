@@ -9,12 +9,21 @@ import NaturalLanguage
 /// Thread safety: `whisperKit` and `currentModel` are guarded by `kitLock`
 /// to prevent races between `loadModel` and concurrent `transcribe`/`detectLanguage`
 /// calls. `@Published status` is always updated on the main thread.
+///
+/// Memory management: The WhisperKit model (~626MB) is automatically unloaded
+/// after `idleUnloadInterval` of inactivity to reclaim memory. It is reloaded
+/// on the next transcription request.
 final class WhisperTranscriptionService: ObservableObject {
     private var whisperKit: WhisperKit?
     private var currentModel: String?
 
     /// Serialises access to `whisperKit` and `currentModel` across async contexts.
     private let kitLock = NSLock()
+
+    /// Timer that fires after extended idle to unload the model from memory.
+    private var idleUnloadTimer: Timer?
+    /// How long to keep the model in memory after the last use (10 minutes).
+    private let idleUnloadInterval: TimeInterval = 600
 
     /// Whether the WhisperKit model has been downloaded and is ready to use.
     var isReady: Bool {
@@ -55,6 +64,7 @@ final class WhisperTranscriptionService: ObservableObject {
         kitLock.lock()
         if whisperKit != nil && currentModel == model {
             kitLock.unlock()
+            resetIdleTimer()
             return
         }
         kitLock.unlock()
@@ -68,6 +78,7 @@ final class WhisperTranscriptionService: ObservableObject {
             currentModel = model
             kitLock.unlock()
             setStatus(.ready)
+            resetIdleTimer()
             print("[WhisperTranscription] Model '\(model)' loaded successfully")
         } catch {
             // Clear stale state on failure so isReady stays false
@@ -78,6 +89,59 @@ final class WhisperTranscriptionService: ObservableObject {
             setStatus(.error(error.localizedDescription))
             print("[WhisperTranscription] Failed to load model: \(error.localizedDescription)")
         }
+    }
+
+    /// Unload the model from memory to reclaim ~626MB. The model will be
+    /// reloaded on the next transcription request via `loadModel`.
+    func unloadModel() {
+        kitLock.lock()
+        let hadModel = whisperKit != nil
+        whisperKit = nil
+        currentModel = nil
+        kitLock.unlock()
+        invalidateIdleTimer()
+        if hadModel {
+            setStatus(.notDownloaded)
+            print("[WhisperTranscription] Model unloaded to reclaim memory")
+        }
+    }
+
+    /// Reset the idle unload timer — called after every model use.
+    private func resetIdleTimer() {
+        let performOnMain = { [weak self] in
+            guard let self else { return }
+            self.idleUnloadTimer?.invalidate()
+            self.idleUnloadTimer = Timer.scheduledTimer(withTimeInterval: self.idleUnloadInterval, repeats: false) { [weak self] _ in
+                self?.unloadModel()
+            }
+        }
+        if Thread.isMainThread {
+            performOnMain()
+        } else {
+            DispatchQueue.main.async(execute: performOnMain)
+        }
+    }
+
+    /// Cancel the idle timer without unloading.
+    private func invalidateIdleTimer() {
+        let performOnMain = { [weak self] in
+            self?.idleUnloadTimer?.invalidate()
+            self?.idleUnloadTimer = nil
+        }
+        if Thread.isMainThread {
+            performOnMain()
+        } else {
+            DispatchQueue.main.async(execute: performOnMain)
+        }
+    }
+
+    deinit {
+        idleUnloadTimer?.invalidate()
+        idleUnloadTimer = nil
+        kitLock.lock()
+        whisperKit = nil
+        currentModel = nil
+        kitLock.unlock()
     }
 
     // MARK: - Transcription
@@ -100,6 +164,7 @@ final class WhisperTranscriptionService: ObservableObject {
         }
 
         let results = try await kit.transcribe(audioPath: fileURL.path, decodeOptions: options)
+        resetIdleTimer()
 
         guard let result = results.first else {
             return []
@@ -121,6 +186,7 @@ final class WhisperTranscriptionService: ObservableObject {
         let options = DecodingOptions(wordTimestamps: false)
         do {
             let results = try await kit.transcribe(audioPath: fileURL.path, decodeOptions: options)
+            resetIdleTimer()
             if let lang = results.first?.language, !lang.isEmpty {
                 // WhisperKit returns ISO codes like "en", "de"
                 switch lang {
@@ -130,6 +196,7 @@ final class WhisperTranscriptionService: ObservableObject {
                 }
             }
         } catch {
+            resetIdleTimer()
             print("[WhisperTranscription] Language detection failed: \(error.localizedDescription)")
         }
 

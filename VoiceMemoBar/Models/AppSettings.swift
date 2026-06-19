@@ -84,6 +84,10 @@ final class AppSettings: ObservableObject {
 
     /// Save a folder URL from NSOpenPanel (which has implicit security scope).
     func saveBaseFolder(_ url: URL) {
+        // Release the old security scope before switching to a new folder —
+        // prevents leaking sandbox resource tokens.
+        stopAccessingBaseFolder()
+
         defaults.set(url.path, forKey: Keys.baseFolderPath)
         do {
             let bookmark = try url.bookmarkData(
