@@ -327,6 +327,8 @@ final class RecorderViewModel: ObservableObject {
 
     /// Append a single quicknote line to the existing note file on disk,
     /// inserting it right before the empty line after "## Quicknotes".
+    /// Uses NSFileCoordinator to safely coordinate with Obsidian or other
+    /// editors that may be reading/writing the same file simultaneously.
     private func appendQuickNoteToFile(time: String, text: String) {
         guard let noteURL = currentNoteURL else {
             print("[RecorderViewModel] No note file URL, cannot append quicknote")
@@ -339,36 +341,44 @@ final class RecorderViewModel: ObservableObject {
             return
         }
 
-        guard let existing = try? String(contentsOf: noteURL, encoding: .utf8) else {
-            print("[RecorderViewModel] Could not read note file for quicknote append")
-            return
-        }
-
         let noteLine = "\(time) \(text)"
+        let coordinator = NSFileCoordinator()
+        var coordinatorError: NSError?
 
-        // Strategy: find "## Quicknotes" and insert the new line after any
-        // existing quicknotes (before the next "##" section or blank-line gap).
-        var lines = existing.components(separatedBy: "\n")
-        if let qnIndex = lines.firstIndex(where: { $0.hasPrefix("## Quicknotes") }) {
-            // Find where to insert: after the last non-empty, non-heading line
-            // following "## Quicknotes".
-            var insertAt = qnIndex + 1
-            while insertAt < lines.count {
-                let line = lines[insertAt]
-                if line.isEmpty || line.hasPrefix("## ") { break }
-                insertAt += 1
+        coordinator.coordinate(writingItemAt: noteURL, options: [], error: &coordinatorError) { coordinatedURL in
+            guard let existing = try? String(contentsOf: coordinatedURL, encoding: .utf8) else {
+                print("[RecorderViewModel] Could not read note file for quicknote append")
+                return
             }
-            lines.insert(noteLine, at: insertAt)
-        } else {
-            // Fallback: just append
-            lines.append(noteLine)
+
+            // Strategy: find "## Quicknotes" and insert the new line after any
+            // existing quicknotes (before the next "##" section or blank-line gap).
+            var lines = existing.components(separatedBy: "\n")
+            if let qnIndex = lines.firstIndex(where: { $0.hasPrefix("## Quicknotes") }) {
+                // Find where to insert: after the last non-empty, non-heading line
+                // following "## Quicknotes".
+                var insertAt = qnIndex + 1
+                while insertAt < lines.count {
+                    let line = lines[insertAt]
+                    if line.isEmpty || line.hasPrefix("## ") { break }
+                    insertAt += 1
+                }
+                lines.insert(noteLine, at: insertAt)
+            } else {
+                // Fallback: just append
+                lines.append(noteLine)
+            }
+
+            let updated = lines.joined(separator: "\n")
+            do {
+                try updated.write(to: coordinatedURL, atomically: true, encoding: .utf8)
+            } catch {
+                print("[RecorderViewModel] Failed to write quicknote: \(error.localizedDescription)")
+            }
         }
 
-        let updated = lines.joined(separator: "\n")
-        do {
-            try updated.write(to: noteURL, atomically: true, encoding: .utf8)
-        } catch {
-            print("[RecorderViewModel] Failed to write quicknote: \(error.localizedDescription)")
+        if let error = coordinatorError {
+            print("[RecorderViewModel] File coordination failed: \(error.localizedDescription)")
         }
     }
 
@@ -519,30 +529,45 @@ final class RecorderViewModel: ObservableObject {
     /// Update the transcript file's backlink to point to the renamed note.
     private func updateTranscriptBacklink(dateString: String, noteSlug: String) {
         guard let transcriptsURL = AppSettings.shared.transcriptsURL else { return }
+
+        // Defense-in-depth: re-sanitize slug before embedding in file content
+        let slug = sanitizeSlug(noteSlug)
+        guard !slug.isEmpty else {
+            print("[RecorderViewModel] Slug sanitized to empty, skipping backlink update")
+            return
+        }
+
         let filename = "\(dateString)-transcript.md"
         let fileURL = transcriptsURL.appendingPathComponent(filename)
 
         guard var content = try? String(contentsOf: fileURL, encoding: .utf8) else { return }
 
         let oldBacklink = "Source: [[\(dateString)-note]]"
-        let newBacklink = "Source: [[\(dateString)-\(noteSlug)]]"
+        let newBacklink = "Source: [[\(dateString)-\(slug)]]"
         content = content.replacingOccurrences(of: oldBacklink, with: newBacklink)
 
         try? content.write(to: fileURL, atomically: true, encoding: .utf8)
-        print("[RecorderViewModel] Updated transcript backlink to: \(dateString)-\(noteSlug)")
+        print("[RecorderViewModel] Updated transcript backlink to: \(dateString)-\(slug)")
     }
 
     /// Sanitize a slug from LLM output: strip path-traversal sequences,
-    /// control characters, and enforce a length limit. Defense-in-depth —
-    /// OllamaService already filters, but we don't trust upstream fully.
+    /// control characters, null bytes, and enforce a length limit.
+    /// Defense-in-depth — OllamaService already filters, but we don't
+    /// trust upstream fully.
     private func sanitizeSlug(_ raw: String) -> String {
         let safe = raw
+            // Strip null bytes and control characters first
+            .unicodeScalars.filter { $0.value >= 0x20 && $0 != "\0" }
+            .reduce(into: "") { $0.append(Character($1)) }
             .replacingOccurrences(of: "..", with: "")
             .replacingOccurrences(of: "/", with: "")
             .replacingOccurrences(of: "\\", with: "")
+            .replacingOccurrences(of: ":", with: "")
             .filter { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-") }
             .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
             .replacingOccurrences(of: "--+", with: "-", options: .regularExpression)
+
+        guard !safe.isEmpty else { return "" }
 
         // Hard cap at 60 characters
         if safe.count <= 60 { return safe }

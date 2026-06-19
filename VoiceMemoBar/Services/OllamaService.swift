@@ -153,12 +153,15 @@ final class OllamaService {
 
         // Security: the .filter above already strips "/" and "." (only ASCII
         // letters, digits, and "-" survive), but as defense-in-depth we
-        // explicitly reject path-traversal patterns and control characters.
-        // This guards against future refactors that might loosen the filter.
+        // explicitly reject path-traversal patterns, null bytes, and control
+        // characters. This guards against future refactors that might loosen
+        // the filter.
         let sanitized = cleaned
+            .replacingOccurrences(of: "\0", with: "")
             .replacingOccurrences(of: "..", with: "")
             .replacingOccurrences(of: "/", with: "")
             .replacingOccurrences(of: "\\", with: "")
+            .replacingOccurrences(of: ":", with: "")
             .filter { !$0.isNewline && $0.asciiValue.map({ $0 >= 32 }) ?? false }
 
         guard !sanitized.isEmpty else { throw OllamaError.invalidResponse }

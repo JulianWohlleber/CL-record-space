@@ -32,6 +32,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         observeState()
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        // Balance security-scoped bookmark: release the sandbox resource
+        // token acquired by accessBaseFolder(). Without this, the token
+        // leaks until the process exits (macOS reclaims it, but explicit
+        // cleanup is correct practice for balanced start/stop).
+        AppSettings.shared.stopAccessingBaseFolder()
+    }
+
     private func setupStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = statusItem.button {
