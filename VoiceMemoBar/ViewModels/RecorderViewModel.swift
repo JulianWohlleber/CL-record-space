@@ -105,6 +105,15 @@ final class RecorderViewModel: ObservableObject {
                     }
                 }
 
+                // Handle unexpected audio engine stop (e.g. mic disconnected)
+                audioService.onUnexpectedStop = { [weak self] in
+                    guard let self else { return }
+                    if self.state == .recording || self.state == .paused {
+                        self.errorMessage = "Microphone disconnected — saving recording."
+                        self.stopRecording()
+                    }
+                }
+
                 try audioService.startRecording()
                 state = .recording
                 elapsedTime = 0

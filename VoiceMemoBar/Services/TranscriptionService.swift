@@ -19,7 +19,9 @@ struct TimedSegment {
 final class TranscriptionService {
     private let paragraphInterval: TimeInterval = 120.0  // 2 minutes
     private let chunkLength: TimeInterval = 180.0        // 3 minute chunks for long files
+    private let chunkOverlap: TimeInterval = 5.0         // overlap between chunks to avoid splitting words at boundaries
     private let detectionSampleLength: TimeInterval = 25.0 // first N seconds used for language detection
+    private let recognitionTimeout: TimeInterval = 120.0  // max wait per recognition request
 
     /// Domain-specific terms that bias recognition toward expected vocabulary
     /// (project names, technical jargon, proper nouns). Up to ~100 terms recommended.
@@ -54,10 +56,19 @@ final class TranscriptionService {
             } catch {
                 print("[TranscriptionService] Chunk export \(offset)-\(end) failed: \(error.localizedDescription)")
             }
-            offset = end
+            // Advance by chunkLength minus overlap so the next chunk's start
+            // covers the tail of this chunk. Words in the overlap region will
+            // be deduplicated below.
+            let advance = end >= duration ? duration - offset : chunkLength - chunkOverlap
+            offset += advance
         }
 
-        return buildParagraphs(from: allRaw)
+        // Deduplicate words in overlap regions: if two consecutive segments
+        // have timestamps within 0.3s of each other and the same text,
+        // drop the duplicate (the later one, which came from the next chunk).
+        let deduped = deduplicateOverlapWords(allRaw)
+
+        return buildParagraphs(from: deduped)
     }
 
     /// Detect the spoken language by sampling the first N seconds, transcribing with
@@ -181,20 +192,45 @@ final class TranscriptionService {
             request.addsPunctuation = true
         }
 
-        let result: SFSpeechRecognitionResult = try await withCheckedThrowingContinuation { continuation in
-            var hasResumed = false
-            recognizer.recognitionTask(with: request) { result, error in
-                guard !hasResumed else { return }
-                if let error {
-                    hasResumed = true
-                    continuation.resume(throwing: error)
-                    return
-                }
-                if let result, result.isFinal {
-                    hasResumed = true
-                    continuation.resume(returning: result)
+        // Wrap the recognition in a timeout to catch cases where the
+        // recognizer hangs (Apple's on-device recognizer can stall on
+        // long or unusual audio).
+        let result: SFSpeechRecognitionResult = try await withThrowingTaskGroup(of: SFSpeechRecognitionResult.self) { group in
+            group.addTask {
+                try await withCheckedThrowingContinuation { continuation in
+                    var hasResumed = false
+                    let task = recognizer.recognitionTask(with: request) { result, error in
+                        guard !hasResumed else { return }
+                        if let error {
+                            hasResumed = true
+                            continuation.resume(throwing: error)
+                            return
+                        }
+                        if let result, result.isFinal {
+                            hasResumed = true
+                            continuation.resume(returning: result)
+                        }
+                    }
+                    // If the parent task is cancelled, cancel the recognition too
+                    Task {
+                        await withTaskCancellationHandler {
+                            // nothing on start
+                        } onCancel: {
+                            task.cancel()
+                        }
+                    }
                 }
             }
+
+            group.addTask { [recognitionTimeout] in
+                try await Task.sleep(nanoseconds: UInt64(recognitionTimeout * 1_000_000_000))
+                throw TranscriptionError.recognitionTimedOut
+            }
+
+            // Return the first result (recognition or timeout)
+            let first = try await group.next()!
+            group.cancelAll()
+            return first
         }
 
         return result.bestTranscription.segments.map { seg in
@@ -206,6 +242,27 @@ final class TranscriptionService {
         }
     }
 
+    /// Remove duplicate words that appear in chunk overlap regions.
+    /// Two words are considered duplicates if they have the same text
+    /// (case-insensitive) and timestamps within 0.5s of each other.
+    private func deduplicateOverlapWords(_ segments: [RawSegment]) -> [RawSegment] {
+        guard segments.count > 1 else { return segments }
+
+        var result: [RawSegment] = [segments[0]]
+        for i in 1..<segments.count {
+            let current = segments[i]
+            let previous = result.last!
+            let timeDelta = abs(current.timestamp - previous.timestamp)
+            let sameText = current.text.lowercased() == previous.text.lowercased()
+            if sameText && timeDelta < 0.5 {
+                // Skip duplicate from overlap region
+                continue
+            }
+            result.append(current)
+        }
+        return result
+    }
+
     // MARK: - Chunk Export
 
     private func exportChunk(from asset: AVURLAsset, start: TimeInterval, end: TimeInterval) async throws -> URL {
@@ -214,7 +271,7 @@ final class TranscriptionService {
             .appendingPathExtension("m4a")
 
         guard let session = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetAppleM4A) else {
-            throw TranscriptionError.recognizerUnavailable
+            throw TranscriptionError.chunkExportFailed
         }
 
         let startTime = CMTime(seconds: start, preferredTimescale: 44100)
@@ -226,7 +283,9 @@ final class TranscriptionService {
         await session.export()
 
         guard session.status == .completed else {
-            throw TranscriptionError.recognizerUnavailable
+            // Clean up partial output
+            try? FileManager.default.removeItem(at: chunkURL)
+            throw TranscriptionError.chunkExportFailed
         }
 
         return chunkURL
@@ -334,11 +393,17 @@ final class TranscriptionService {
 
 enum TranscriptionError: LocalizedError {
     case recognizerUnavailable
+    case chunkExportFailed
+    case recognitionTimedOut
 
     var errorDescription: String? {
         switch self {
         case .recognizerUnavailable:
             return "Speech recognizer is not available."
+        case .chunkExportFailed:
+            return "Failed to export audio chunk for transcription."
+        case .recognitionTimedOut:
+            return "Speech recognition timed out."
         }
     }
 }

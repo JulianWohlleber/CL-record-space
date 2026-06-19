@@ -5,12 +5,23 @@ import NaturalLanguage
 /// WhisperKit-based transcription service — significantly more accurate than
 /// Apple's SFSpeechRecognizer, especially for German and technical English.
 /// Uses CoreML + Neural Engine on Apple Silicon.
-final class WhisperTranscriptionService {
+///
+/// Thread safety: `whisperKit` and `currentModel` are guarded by `kitLock`
+/// to prevent races between `loadModel` and concurrent `transcribe`/`detectLanguage`
+/// calls. `@Published status` is always updated on the main thread.
+final class WhisperTranscriptionService: ObservableObject {
     private var whisperKit: WhisperKit?
     private var currentModel: String?
 
+    /// Serialises access to `whisperKit` and `currentModel` across async contexts.
+    private let kitLock = NSLock()
+
     /// Whether the WhisperKit model has been downloaded and is ready to use.
-    var isReady: Bool { whisperKit != nil }
+    var isReady: Bool {
+        kitLock.lock()
+        defer { kitLock.unlock() }
+        return whisperKit != nil
+    }
 
     /// Human-readable status for UI (downloading, ready, error, etc.)
     @Published var status: ModelStatus = .notDownloaded
@@ -22,6 +33,17 @@ final class WhisperTranscriptionService {
         case error(String)
     }
 
+    /// Update status on the main thread to avoid @Published data races.
+    private func setStatus(_ newStatus: ModelStatus) {
+        if Thread.isMainThread {
+            status = newStatus
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                self?.status = newStatus
+            }
+        }
+    }
+
     // MARK: - Model Management
 
     /// Recommended model for accuracy on Apple Silicon Macs.
@@ -30,18 +52,30 @@ final class WhisperTranscriptionService {
 
     /// Initialize WhisperKit with the specified model. Downloads if needed.
     func loadModel(_ model: String = WhisperTranscriptionService.defaultModel) async {
-        if whisperKit != nil && currentModel == model { return }
+        kitLock.lock()
+        if whisperKit != nil && currentModel == model {
+            kitLock.unlock()
+            return
+        }
+        kitLock.unlock()
 
-        status = .downloading(progress: 0)
+        setStatus(.downloading(progress: 0))
         do {
             let config = WhisperKitConfig(model: model)
             let kit = try await WhisperKit(config)
+            kitLock.lock()
             whisperKit = kit
             currentModel = model
-            status = .ready
+            kitLock.unlock()
+            setStatus(.ready)
             print("[WhisperTranscription] Model '\(model)' loaded successfully")
         } catch {
-            status = .error(error.localizedDescription)
+            // Clear stale state on failure so isReady stays false
+            kitLock.lock()
+            whisperKit = nil
+            currentModel = nil
+            kitLock.unlock()
+            setStatus(.error(error.localizedDescription))
             print("[WhisperTranscription] Failed to load model: \(error.localizedDescription)")
         }
     }
@@ -51,9 +85,12 @@ final class WhisperTranscriptionService {
     /// Transcribe an audio file returning `[TimedSegment]` compatible with the
     /// existing marker algorithm.
     func transcribe(fileURL: URL, locale: Locale? = nil) async throws -> [TimedSegment] {
+        kitLock.lock()
         guard let kit = whisperKit else {
+            kitLock.unlock()
             throw WhisperTranscriptionError.modelNotLoaded
         }
+        kitLock.unlock()
 
         var options = DecodingOptions(wordTimestamps: true)
         if let locale {
@@ -73,9 +110,12 @@ final class WhisperTranscriptionService {
 
     /// Detect the dominant language from the first portion of audio.
     func detectLanguage(fileURL: URL) async -> Locale {
+        kitLock.lock()
         guard let kit = whisperKit else {
+            kitLock.unlock()
             return Locale(identifier: "en-US")
         }
+        kitLock.unlock()
 
         // Quick transcription with auto language detection
         let options = DecodingOptions(wordTimestamps: false)

@@ -36,18 +36,7 @@ final class OllamaService {
             "stream": false
         ]
 
-        let url = URL(string: "\(baseURL)/api/generate")!
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        request.timeoutInterval = 120
-
-        let (data, response) = try await URLSession.shared.data(for: request)
-
-        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
-            throw OllamaError.requestFailed
-        }
+        let data = try await ollamaRequest(body: body, timeout: 120)
 
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let correctedText = json["response"] as? String else {
@@ -57,16 +46,28 @@ final class OllamaService {
         let trimmed = correctedText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return rawText }
 
-        // Safety check: if the original had ==markers== but correction lost them,
-        // fall back to the raw transcript to avoid silently dropping highlights.
-        let originalMarkerCount = rawText.components(separatedBy: "==").count
-        let correctedMarkerCount = trimmed.components(separatedBy: "==").count
-        if originalMarkerCount > 1 && correctedMarkerCount < originalMarkerCount {
+        // Safety check: count actual "==" delimiters (not split components).
+        // Each marker pair uses exactly two "==" tokens (open + close), so the
+        // corrected text must have at least as many as the original.
+        let originalMarkerCount = countOccurrences(of: "==", in: rawText)
+        let correctedMarkerCount = countOccurrences(of: "==", in: trimmed)
+        if originalMarkerCount > 0 && correctedMarkerCount < originalMarkerCount {
             print("[OllamaService] Correction lost markers (\(originalMarkerCount) -> \(correctedMarkerCount)), using raw transcript")
             return rawText
         }
 
         return trimmed
+    }
+
+    /// Count non-overlapping occurrences of a substring.
+    private func countOccurrences(of needle: String, in haystack: String) -> Int {
+        var count = 0
+        var searchRange = haystack.startIndex..<haystack.endIndex
+        while let range = haystack.range(of: needle, range: searchRange) {
+            count += 1
+            searchRange = range.upperBound..<haystack.endIndex
+        }
+        return count
     }
 
     /// Generate a short kebab-case title from transcript text.
@@ -106,27 +107,23 @@ final class OllamaService {
             "stream": false
         ]
 
-        let url = URL(string: "\(baseURL)/api/generate")!
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        request.timeoutInterval = 30
-
-        let (data, response) = try await URLSession.shared.data(for: request)
-
-        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
-            throw OllamaError.requestFailed
-        }
+        let data = try await ollamaRequest(body: body, timeout: 30)
 
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let raw = json["response"] as? String else {
             throw OllamaError.invalidResponse
         }
 
+        // LLMs sometimes return multi-line output with explanations.
+        // Take only the first non-empty line.
+        let firstLine = raw
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .first(where: { !$0.isEmpty }) ?? raw
+
         // Clean up: lowercase, transliterate German umlauts, keep only
         // ASCII alphanumerics and hyphens.
-        let cleaned = raw
+        let cleaned = firstLine
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
             .replacingOccurrences(of: "\"", with: "")
@@ -137,17 +134,27 @@ final class OllamaService {
             .replacingOccurrences(of: " ", with: "-")
             .filter { ($0.isASCII && $0.isLetter) || $0.isNumber || $0 == "-" }
             .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+            // Collapse consecutive hyphens (e.g. from stripped punctuation)
+            .replacingOccurrences(of: "--+", with: "-", options: .regularExpression)
 
         guard !cleaned.isEmpty else { throw OllamaError.invalidResponse }
-        // Cap at 60 chars
-        return String(cleaned.prefix(60))
+        // Cap at 60 chars — trim on a hyphen boundary if possible so we don't
+        // produce a truncated word.
+        if cleaned.count <= 60 { return cleaned }
+        let truncated = String(cleaned.prefix(60))
+        if let lastHyphen = truncated.lastIndex(of: "-") {
+            return String(truncated[truncated.startIndex..<lastHyphen])
+        }
+        return truncated
     }
 
     /// Check if Ollama is running AND the configured model is available.
     func isAvailable() async -> Bool {
         guard let url = URL(string: "\(baseURL)/api/tags") else { return false }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 5  // Quick check — don't wait long
         do {
-            let (data, response) = try await URLSession.shared.data(from: url)
+            let (data, response) = try await URLSession.shared.data(for: request)
             guard (response as? HTTPURLResponse)?.statusCode == 200 else { return false }
 
             // Verify the configured model is actually pulled
@@ -172,18 +179,67 @@ final class OllamaService {
             return false
         }
     }
+
+    // MARK: - Shared Request
+
+    /// Send a request to Ollama's /api/generate endpoint with proper error
+    /// discrimination (connection refused vs timeout vs model not loaded).
+    private func ollamaRequest(body: [String: Any], timeout: TimeInterval) async throws -> Data {
+        let url = URL(string: "\(baseURL)/api/generate")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        request.timeoutInterval = timeout
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await URLSession.shared.data(for: request)
+        } catch let urlError as URLError {
+            switch urlError.code {
+            case .timedOut:
+                throw OllamaError.timeout
+            case .cannotConnectToHost, .cannotFindHost:
+                throw OllamaError.connectionRefused
+            default:
+                throw OllamaError.networkError(urlError.localizedDescription)
+            }
+        }
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw OllamaError.requestFailed
+        }
+
+        // Ollama returns 404 when the model isn't pulled
+        if httpResponse.statusCode == 404 {
+            throw OllamaError.modelNotFound(model)
+        }
+
+        guard httpResponse.statusCode == 200 else {
+            throw OllamaError.requestFailed
+        }
+
+        return data
+    }
 }
 
 enum OllamaError: LocalizedError {
     case requestFailed
     case invalidResponse
     case modelNotFound(String)
+    case timeout
+    case connectionRefused
+    case networkError(String)
 
     var errorDescription: String? {
         switch self {
-        case .requestFailed: return "Ollama request failed"
-        case .invalidResponse: return "Invalid response from Ollama"
-        case .modelNotFound(let name): return "Model '\(name)' not found in Ollama"
+        case .requestFailed: return "Ollama request failed."
+        case .invalidResponse: return "Invalid response from Ollama."
+        case .modelNotFound(let name): return "Model '\(name)' not found in Ollama. Run: ollama pull \(name)"
+        case .timeout: return "Ollama request timed out — the model may still be loading."
+        case .connectionRefused: return "Cannot connect to Ollama. Is it running? (ollama serve)"
+        case .networkError(let msg): return "Network error: \(msg)"
         }
     }
 }

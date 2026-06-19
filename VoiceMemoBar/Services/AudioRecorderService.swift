@@ -21,6 +21,14 @@ final class AudioRecorderService {
     var onFileSizeUpdate: ((Int64) -> Void)?
     private var fileSizeTimer: Timer?
 
+    /// Called on main queue when the audio engine stops unexpectedly
+    /// (e.g. microphone disconnected). The recording is preserved up to
+    /// the point of disconnection.
+    var onUnexpectedStop: (() -> Void)?
+
+    /// Observer for audio engine configuration changes (mic disconnect, etc.)
+    private var configObserver: NSObjectProtocol?
+
     var isRecording: Bool {
         audioEngine?.isRunning ?? false
     }
@@ -34,6 +42,10 @@ final class AudioRecorderService {
         let engine = AVAudioEngine()
         let inputNode = engine.inputNode
         let recordingFormat = inputNode.outputFormat(forBus: 0)
+
+        guard recordingFormat.sampleRate > 0, recordingFormat.channelCount > 0 else {
+            throw AudioRecorderError.noInputDevice
+        }
 
         let tempURL = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)
@@ -49,6 +61,9 @@ final class AudioRecorderService {
             // Read pause flag safely via the lock
             let paused = self.pauseLock.withLock { $0 }
             if paused { return }
+
+            // Reject zero-length buffers (can happen during device transitions)
+            guard buffer.frameLength > 0 else { return }
 
             // Copy buffer data synchronously on the audio thread before
             // dispatching — the engine reuses the buffer's internal storage,
@@ -73,6 +88,23 @@ final class AudioRecorderService {
                 } catch {
                     print("[AudioRecorderService] Write error: \(error.localizedDescription)")
                 }
+            }
+        }
+
+        // Observe audio engine configuration changes (e.g. microphone disconnected).
+        // When the input device is removed, AVAudioEngine stops automatically.
+        // We detect this and notify the caller so the UI can react gracefully.
+        configObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: engine,
+            queue: nil
+        ) { [weak self] _ in
+            guard let self else { return }
+            // The engine has been reset — it is no longer running.
+            // Drain pending writes and notify the caller.
+            if !(self.audioEngine?.isRunning ?? false) {
+                print("[AudioRecorderService] Audio engine stopped (device change)")
+                self.handleUnexpectedStop()
             }
         }
 
@@ -111,18 +143,23 @@ final class AudioRecorderService {
 
     func stop() {
         stopFileSizePolling()
+        removeConfigObserver()
 
         // 1. Stop accepting new buffers
         pauseLock.withLock { $0 = true }
 
         // 2. Remove the tap (synchronous — no new callbacks scheduled after this)
-        audioEngine?.inputNode.removeTap(onBus: 0)
-
-        // 3. Stop the engine
-        audioEngine?.stop()
+        if let engine = audioEngine, engine.isRunning {
+            engine.inputNode.removeTap(onBus: 0)
+            engine.stop()
+        } else {
+            // Engine already stopped (e.g. device disconnected) — still remove tap
+            // to clean up. removeTap is safe even if no tap is installed.
+            audioEngine?.inputNode.removeTap(onBus: 0)
+        }
         audioEngine = nil
 
-        // 4. Wait for any in-flight writes to complete, then release the file.
+        // 3. Wait for any in-flight writes to complete, then release the file.
         //    Setting _audioFile = nil inside the sync block ensures no concurrent
         //    read from the tap closure can race with this assignment.
         fileQueue.sync {
@@ -137,8 +174,45 @@ final class AudioRecorderService {
         }
     }
 
+    /// Handle the audio engine stopping unexpectedly (mic disconnected, etc.).
+    /// Drains in-flight writes and notifies the caller on the main queue.
+    private func handleUnexpectedStop() {
+        stopFileSizePolling()
+        removeConfigObserver()
+        pauseLock.withLock { $0 = true }
+
+        // The engine already stopped — remove the tap to prevent dangling references
+        audioEngine?.inputNode.removeTap(onBus: 0)
+        audioEngine = nil
+
+        // Drain any in-flight writes so the file is complete
+        fileQueue.sync {
+            _audioFile = nil
+        }
+
+        if let url = tempFileURL {
+            let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+            let size = (attrs?[.size] as? Int) ?? 0
+            print("[AudioRecorderService] Unexpected stop — preserved \(size) bytes in \(url.lastPathComponent)")
+        }
+
+        DispatchQueue.main.async { [weak self] in
+            self?.onUnexpectedStop?()
+        }
+    }
+
+    private func removeConfigObserver() {
+        if let observer = configObserver {
+            NotificationCenter.default.removeObserver(observer)
+            configObserver = nil
+        }
+    }
+
     /// Convert recorded .caf to .m4a at destination. Returns true on success.
     func exportToM4A(destination: URL) async -> Bool {
+        // Ensure no in-flight writes are pending before reading the file
+        fileQueue.sync {}
+
         guard let tempURL = tempFileURL else {
             print("[AudioRecorderService] No temp file to export")
             return false
@@ -152,10 +226,38 @@ final class AudioRecorderService {
             return false
         }
 
+        let asset = AVURLAsset(url: tempURL)
+
+        // Validate the source file has readable audio tracks — catches
+        // corrupted or truncated files before the export session tries to read.
+        let tracks: [AVAssetTrack]
+        do {
+            tracks = try await asset.loadTracks(withMediaType: .audio)
+        } catch {
+            print("[AudioRecorderService] Source file unreadable: \(error.localizedDescription)")
+            return false
+        }
+        guard !tracks.isEmpty else {
+            print("[AudioRecorderService] Source file has no audio tracks")
+            return false
+        }
+
+        // Check duration is positive (zero-duration files crash the exporter)
+        let duration: CMTime
+        do {
+            duration = try await asset.load(.duration)
+        } catch {
+            print("[AudioRecorderService] Cannot read source duration: \(error.localizedDescription)")
+            return false
+        }
+        guard duration.seconds > 0 else {
+            print("[AudioRecorderService] Source file has zero duration")
+            return false
+        }
+
         // Remove existing destination if any
         try? FileManager.default.removeItem(at: destination)
 
-        let asset = AVURLAsset(url: tempURL)
         guard let session = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetAppleM4A) else {
             print("[AudioRecorderService] Could not create export session")
             return false
@@ -167,6 +269,8 @@ final class AudioRecorderService {
 
         if session.status != .completed {
             print("[AudioRecorderService] Export failed: \(session.error?.localizedDescription ?? "unknown")")
+            // Clean up partial output
+            try? FileManager.default.removeItem(at: destination)
             return false
         }
         return true
@@ -177,9 +281,26 @@ final class AudioRecorderService {
     }
 
     func cleanupTemp() {
+        // Ensure no in-flight writes are pending before deleting
+        fileQueue.sync {}
         if let url = tempFileURL {
             try? FileManager.default.removeItem(at: url)
             tempFileURL = nil
+        }
+    }
+
+    deinit {
+        removeConfigObserver()
+    }
+}
+
+enum AudioRecorderError: LocalizedError {
+    case noInputDevice
+
+    var errorDescription: String? {
+        switch self {
+        case .noInputDevice:
+            return "No audio input device available."
         }
     }
 }
