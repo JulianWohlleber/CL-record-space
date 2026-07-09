@@ -1,155 +1,93 @@
 # record_space
 
-A macOS menu bar app for voice recording with live transcription, marker highlights, and Obsidian integration.
+Voice recording for your menu bar. Mark moments, take notes, get a transcript — all saved to your Obsidian vault.
 
-Record meetings, lectures, or thoughts. Mark important moments with a hotkey. Get a timestamped, highlighted transcript saved directly to your Obsidian vault.
+![record_space — recording popover, Obsidian output, and settings](assets/app-overview.png)
 
-## Features
+---
 
-- **Menu bar recording** — start/stop from the menu bar or global hotkeys
-- **Marker highlights** — press a hotkey to mark important moments; marked words appear as `==highlighted==` in the transcript
-- **Live quicknotes** — type short notes during recording; they appear immediately in the markdown file
-- **Dual transcription engines** — Apple Speech (fast) or WhisperKit/CoreML (accurate)
-- **Auto language detection** — English and German, or set manually
-- **LLM-powered corrections** — optional Ollama integration for transcript cleanup and auto-titling
-- **Obsidian-native output** — markdown notes with frontmatter, transcript backlinks, and embedded audio
+Record a meeting. Press `⌃⌥⌘M` when something matters — those words show up `==highlighted==` in the transcript. Type a quick note without leaving the call. When you stop, the audio, transcript, and note land in your vault as linked markdown files.
+
+Transcription runs on-device via Apple Speech or WhisperKit (CoreML). An optional local LLM (Ollama) corrects misheard words and generates the note title.
 
 ## Install
 
-### From DMG (recommended)
+**DMG** — download from [Releases](https://github.com/JulianWohlleber/CL-record-space/releases), drag to Applications.
 
-1. Download `record_space.dmg` from [Releases](https://github.com/JulianWohlleber/CL-record-space/releases)
-2. Open the DMG and drag **record_space** to **Applications**
-3. Launch from Applications — the icon appears in your menu bar
+**Source** — requires Xcode 16+, macOS 14+:
 
-### From source
-
-Requires Xcode 16+ and macOS 14+.
-
-```bash
+```
 git clone https://github.com/JulianWohlleber/CL-record-space.git
 cd CL-record-space
 make install
 ```
 
-This builds the app and copies it to `/Applications`.
+## How it works
 
-Other targets:
+Start recording from the menu bar or with `⌃⌥⌘R`. The app creates a note file immediately — quicknotes appear in the markdown as you type them. When you stop, it exports the audio, transcribes it, applies marker highlights, optionally runs LLM correction, generates a title, and renames the note.
 
-```bash
-make build    # build only
-make run      # build and launch
-make dmg      # create a distributable DMG
-make clean    # remove build artifacts
-make uninstall
-```
-
-## Setup
-
-On first launch, record_space asks you to select an **Obsidian vault folder**. It creates two subdirectories:
+Three files per recording:
 
 ```
 your-vault/
-├── recordings/     ← .m4a audio files
-├── transcripts/    ← timestamped transcript markdown
-└── *.md            ← recording notes (linked to transcript + audio)
+├── 2026-06-23-0910-meeting-topic.md      ← note (frontmatter, quicknotes, backlinks)
+├── transcripts/
+│   └── 2026-06-23-0910-transcript.md     ← timestamped transcript with ==highlights==
+└── recordings/
+    └── 2026-06-23-0910-recording.m4a     ← audio
 ```
 
-### Permissions
-
-The app requests:
-- **Microphone** — to record audio
-- **Speech Recognition** — for Apple's on-device transcription
-
-### Optional: Ollama
-
-For LLM-powered transcript correction and auto-generated titles, install [Ollama](https://ollama.com) and pull a model:
-
-```bash
-ollama pull mistral
-```
-
-record_space detects Ollama automatically on `localhost:11434`.
-
-## Global hotkeys
+### Hotkeys
 
 | Shortcut | Action |
 |----------|--------|
-| `⌃⌥⌘R` | Start / Stop recording |
+| `⌃⌥⌘R` | Start / Stop |
 | `⌃⌥⌘P` | Pause / Resume |
-| `⌃⌥⌘M` | Place marker |
-| `⌃⌥⌘N` | Focus quicknote field |
+| `⌃⌥⌘M` | Mark moment |
+| `⌃⌥⌘N` | Quick note |
 
-## Output format
+## Setup
 
-Each recording produces three files:
+On first launch, pick your Obsidian vault folder. The app creates `recordings/` and `transcripts/` subdirectories.
 
-**Note** (`2024-03-29-1430-meeting-title.md`):
-```markdown
----
-Created: 2024-03-29 14:30
----
-[Transcript](transcripts/2024-03-29-1430-transcript.md)
+For LLM-powered transcript correction, install [Ollama](https://ollama.com) and `ollama pull mistral`. Detected automatically on `localhost:11434`.
 
-## Notes
+## Technical details
 
-## Quicknotes
-14:32 Remember to follow up on budget
+Built with SwiftUI and AppKit. Recording uses AVAudioEngine with M4A export. Transcription runs through Apple's SFSpeechRecognizer (3-minute chunks with overlap deduplication) or WhisperKit's CoreML Whisper implementation. Markers map to per-word timestamps within a configurable window. Language detection supports English and German.
 
-## Summary
-#insights
-
-#actions
-- [ ]
-
-#Notes
-```
-
-**Transcript** (`transcripts/2024-03-29-1430-transcript.md`):
-```markdown
-#transcript
-
-![[2024-03-29-1430-recording.m4a]]
-
-[00:00] So let's start with the quarterly review.
-[00:15] The ==main concern is the timeline== for the next release.
-[02:00] Moving on to budget allocation...
-```
-
-**Audio** (`recordings/2024-03-29-1430-recording.m4a`)
-
-## Architecture
+<details>
+<summary>Project structure</summary>
 
 ```
 VoiceMemoBar/
-├── AppDelegate.swift              # Menu bar icon, blink modes, popover
-├── VoiceMemoBarApp.swift          # App entry point
+├── AppDelegate.swift                        Menu bar, popover, blink modes
 ├── Models/
-│   └── AppSettings.swift          # UserDefaults, security-scoped bookmarks
+│   └── AppSettings.swift                    Preferences, security-scoped bookmarks
 ├── Services/
-│   ├── AudioRecorderService.swift       # AVAudioEngine recording + M4A export
-│   ├── TranscriptionService.swift       # Apple SFSpeechRecognizer + chunking
-│   ├── WhisperTranscriptionService.swift # WhisperKit CoreML engine
-│   ├── OllamaService.swift             # LLM transcript correction + titling
-│   ├── HotkeyService.swift             # Global hotkey registration
-│   └── PermissionsService.swift        # Mic + speech permission flow
+│   ├── AudioRecorderService.swift           AVAudioEngine, pause/resume, M4A export
+│   ├── TranscriptionService.swift           SFSpeechRecognizer, chunking, markers
+│   ├── WhisperTranscriptionService.swift    WhisperKit CoreML engine
+│   ├── OllamaService.swift                  LLM correction, title generation
+│   ├── HotkeyService.swift                  Global hotkeys
+│   └── PermissionsService.swift             Mic + speech permissions
 ├── ViewModels/
-│   ├── RecorderViewModel.swift    # Recording state machine + file pipeline
-│   └── SetupViewModel.swift       # First-launch vault selection
+│   ├── RecorderViewModel.swift              State machine, file pipeline
+│   └── SetupViewModel.swift                 First-launch flow
 └── Views/
-    ├── ContentView.swift          # Root view (setup vs recorder)
-    ├── RecorderView.swift         # Recording popover UI
-    ├── SettingsView.swift         # Settings window
-    ├── SetupView.swift            # First-launch setup
-    └── TranscribingView.swift     # Post-recording progress
+    ├── RecorderView.swift                   Recording popover
+    ├── SettingsView.swift                   Settings window
+    ├── SetupView.swift                      Vault selection
+    └── TranscribingView.swift               Progress indicator
 ```
+
+</details>
 
 ## Requirements
 
 - macOS 14.0+
-- Xcode 16+ (to build from source)
-- Apple Silicon or Intel Mac
-- Optional: [Ollama](https://ollama.com) for transcript correction
+- Xcode 16+ (build from source)
+- Optional: [Ollama](https://ollama.com)
 
 ## License
 
