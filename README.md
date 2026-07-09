@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/app-icon.png" width="128" alt="record_space icon" />
+</p>
+
 # record_space
 
 Voice recording for your menu bar. Mark moments, take notes, get a transcript — all saved to your Obsidian vault.
